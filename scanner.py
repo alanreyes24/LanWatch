@@ -1,89 +1,131 @@
 import nmap
-import time
+import sqlite3
+import datetime
+import os
+import socket
+import subprocess
+import re
+from mac_vendor_lookup import MacLookup
 
+time = datetime.datetime.now()
 nm = nmap.PortScanner()
 
+connection = sqlite3.connect(r"C:\repos\LanWatch\LanWatch\db\database.db") # later make this path tied to an environment variable
+cursor = connection.cursor()
+cursor.execute("PRAGMA foreign_keys = ON;")
 
-# CREATE TABLE scans (
-#     id INTEGER PRIMARY KEY,
-#     liveHosts INTEGER NOT NULL,
+sql =  '''
 
+CREATE TABLE if not exists scans (
 
-# )
+    id INTEGER PRIMARY KEY,
+    time TEXT NOT NULL
 
-# CREATETABLE host (
-    
-#     ip STRING NOT NULL,
-#     mac TEXT,
-#     os STRING,
-#     uptime INTEGER
+)
 
-# )
+'''
+cursor.execute(sql)
 
+sql = '''
 
+CREATE TABLE if not exists hosts (
+    ip TEXT NOT NULL,
+    mac TEXT,
+    dns TEXT,
+    os TEXT,
+    uptime INTEGER,
+    scanID INTEGER NOT NULL,
+    FOREIGN KEY (scanID) REFERENCES scans(id)
+)
+
+'''
+
+cursor.execute(sql)
+
+sql = "INSERT INTO scans (time) VALUES (?)"
+cursor.execute(sql, (time,))
+scanID = cursor.lastrowid
 
 liveHosts = []
 localNetwork = "192.168.1.0/24"
 
-print("Starting ping scan to find out how many devices are connected to network...")
-pingScanStart = time.time()
+print("starting ping scan")
 nm.scan(hosts=localNetwork, arguments = "-sn")
-pingScanEnd = time.time()
-print(f"Ping scan finished after {pingScanEnd - pingScanStart:.2f} seconds")
+os.system('cls' if os.name == 'nt' else 'clear')
 
 for host in nm.all_hosts():
     if nm[host].state() == "up":
         liveHosts.append(host)
 
-print(f"Found {len(liveHosts)} devices currently connected to the network")
+liveHosts = ' '.join(liveHosts)
 
-liveHosts = ' '.join(liveHosts) # space seperates the IPs
-
-print("Starting OS detection scan on devices currently connected to the network")
-osScanStart = time.time()
+print("starting detailed scan")
 nm.scan(hosts=liveHosts, arguments = "-O --osscan-guess")
-
-osScanEnd = time.time()
-print(f"OS detection scan finished in {osScanEnd - osScanStart} seconds")
+os.system('cls' if os.name == 'nt' else 'clear')
 
 for host in nm.all_hosts():
 
-    print(f'Host: {host} ({nm[host].hostname()}) - State: {nm[host].state()}')
+    ip = None
+    mac = None
+    os = None
+    uptime = None
+    friendly_name = None
 
-    # Retrieve MAC address if available
+    ip = host
+    dns = nm[host].hostname()
+    if not dns:
+        dns = None
+    
     if 'mac' in nm[host]['addresses']:
-        mac_address = nm[host]['addresses']['mac']
-        print(f'  MAC Address: {mac_address}')
-    else:
-        print("  MAC Address: Not available")
+        mac = nm[host]['addresses']['mac']
+        
+        try:
+            mac_lookup = MacLookup()
+            vendor = mac_lookup.lookup(mac)
+            friendly_name = f"{vendor} device"
+        except:
+            pass
+    
+    # Try NetBIOS name resolution (Windows devices)
+    try:
+        if os.name == 'nt':  # Windows
+            output = subprocess.check_output(f"nbtstat -A {ip}", shell=True).decode('utf-8', errors='ignore')
+            match = re.search(r"<00>\s+UNIQUE\s+(\S+)", output)
+            if match:
+                netbios_name = match.group(1).strip()
+                friendly_name = netbios_name
+        else:  # Linux/Mac
+            output = subprocess.check_output(f"nmblookup -A {ip}", shell=True).decode('utf-8', errors='ignore')
+            if "<00>" in output:
+                netbios_name = output.split("<00>")[0].strip()
+                friendly_name = netbios_name
+    except:
+        pass
+        
+    # Try mDNS resolution (Apple/IoT devices)
+    try:
+        mdns_name = socket.gethostbyaddr(ip)[0]
+        if mdns_name and ".local" in mdns_name:
+            friendly_name = mdns_name
+    except:
+        pass
+    
+    if friendly_name and not dns:
+        dns = friendly_name
 
-    # Sort osmatch by accuracy in descending order and pick the most likely match
     if nm[host]['osmatch']:
-        most_likely_os = max(nm[host]['osmatch'], key=lambda x: int(x['accuracy']))
-        print(f'  Most Likely OS: {most_likely_os["name"]} (accuracy: {most_likely_os["accuracy"]}%)')
-
-    # # Access osclass details if available
-    # if 'osclass' in most_likely_os:
-    #     osclass = most_likely_os['osclass'][0]  # Take the first osclass entry
-    #     print(f'    OS Class: {osclass["type"]}, Vendor: {osclass["vendor"]}, Family: {osclass["osfamily"]}')
-    #     print(f'    OS Generation: {osclass.get("osgen", "N/A")}, Accuracy: {osclass["accuracy"]}%')
-
-    else:
-        print("  OS detection not available.")
+        os = nm[host]['osmatch'][0]['name']
 
     if 'uptime' in nm[host]:
         uptime = nm[host]['uptime']
         seconds = int(uptime["seconds"])
-        days = seconds // (24 * 3600)
-        hours = (seconds % (24 * 3600)) // 3600
-        minutes = (seconds % 3600) // 60
-        print(f'  Uptime: {days} days, {hours} hours, {minutes} minutes')
-        print(f'  Last Boot Time: {uptime["lastboot"]}')
-    else:
-        print("  Uptime information not available.")
+        uptime = seconds
 
-    print("-" * 50)
+    print(f"Host: {ip}, Name: {dns if dns else 'Unknown'}")
+    
+    sql = "INSERT INTO hosts (ip, mac, dns, os, uptime, scanID) VALUES (?, ?, ?, ?, ?, ?)"
+    cursor.execute(sql, (ip, mac, dns, os, uptime, scanID))
 
-totalScanTime = pingScanEnd -  pingScanStart + osScanEnd - osScanStart
-print(f"Total scan time: {totalScanTime:.2f}")
+print("finished!")
 
+connection.commit()
